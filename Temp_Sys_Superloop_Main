@@ -1,0 +1,174 @@
+#include "mbed.h"
+#include "LCD_SPI.h"
+
+// ===========================================================
+//                       HARDWARE SETUP
+// ===========================================================
+
+LCD_SPI lcd(D11, D12, D13, D10);        // LCD SPI -  MOSI, MISO, SCLK, CS
+I2C temp_sensor(I2C_SDA, I2C_SCL);      // Temp sensor (DS1631) I2C
+BufferedSerial pc(USBTX, USBRX, 9600);  // Serial Output to Console
+
+AnalogIn upperPot(A0);                 // Upper threshold Potentiometer
+AnalogIn lowerPot(A1);                 // Lower threshold Potentiometer
+
+// InterruptIn muteButton(D2);                   // Button as interrupt source
+
+PwmOut buzzer(D9);                     // Buzzer for Warnings
+
+DigitalOut rLed(D7);                   // Red LED - High temp warning
+DigitalOut yLed(D6);                   // Yellow LED - Normal temp 
+DigitalOut bLed(D5);                   // Blue LED - Low temp Warning
+
+// --------- Temperature Sensor Constants --------- //
+
+const int temp_addr = 0x90;         // I2C address of DS1631
+char commands[] = {0x51, 0xAA};     // 0x51: start convert, 0xAA: read temp
+
+// -------------------- System Globals ---------------------- //
+
+float upperThreshold = 26.0f;           // Default upper threshold (°C)
+float lowerThreshold = 20.0f;           // Default lower threshold (°C)
+
+float currentTemp = 0.0f;               // Current Temprature Variable               
+float maxTempHour = 0.0f;               // Max Temp Variable
+float minTempHour = 0.0f;               // Min hour Variable
+
+bool firstSample  = true;               // To initialise max/min from first reading
+bool alarmMuted   = false;              // Turn Off Alarm
+bool muteEvent = false;                 // Set by ISR
+
+uint32_t hourTimerMs = 0;
+uint32_t lastMuteTime = 0;              // Debounce timing
+uint32_t muteDebounceMs = 250;
+
+Timer lcdTimer;
+
+// ------------------- TEMPERATURE READ ------------------ //
+
+float read_temperature()
+{
+
+    char read_temp[2];
+
+    // Start temperature conversion
+    temp_sensor.write(temp_addr, &commands[0], 1, false);
+    thread_sleep_for(200);  // Wait for conversion 
+
+    // Read last converted temperature
+    temp_sensor.write(temp_addr, &commands[1], 1, false);
+    temp_sensor.read(temp_addr, read_temp, 2);
+
+    // Temp Values
+    int16_t raw = (read_temp[0] << 8) | read_temp[1];
+    float temp = raw / 256.0f;
+
+    return temp;
+}
+
+// -----------------  Main Thread ------------------ //
+
+int main()
+{
+    // Buzzer setup
+    buzzer.period_us(500);     // 2 kHz
+    buzzer.write(0.0f);        // Off initially
+
+    // Led Setup
+    rLed = 0;
+    yLed = 0;
+    bLed = 0;
+
+    // -------- LCD Init --------- //
+    lcd.init_lcd();
+    lcd.clr_lcd();
+
+    lcd.set_cursor(1, 0);
+    lcd.printf(" Temperature System ");
+
+    lcd.set_cursor(2, 0);
+    lcd.printf("......Starting......");
+
+    thread_sleep_for(2000);
+    lcd.clr_lcd();
+    lcdTimer.start();
+
+    // --------------  Main Loop -------------- //
+    while (1) {
+
+        // -------- Read Temp -------- //
+        currentTemp = read_temperature();
+
+        // -------- hourly Min / Max -------- //
+        if (firstSample) {
+            maxTempHour = currentTemp;
+            minTempHour = currentTemp;
+            firstSample = false;
+            hourTimerMs = 0;
+        } else {
+            if (currentTemp > maxTempHour) maxTempHour = currentTemp;
+            if (currentTemp < minTempHour) minTempHour = currentTemp;
+        }
+
+        hourTimerMs += 200;
+        if (hourTimerMs >= 3600000) {
+            hourTimerMs = 0;
+            maxTempHour = currentTemp;
+            minTempHour = currentTemp;
+        }
+
+        // ------------ Read Both Potenciometers -------- //
+        upperThreshold = upperPot.read() * 50.0f;  // 0–50°C
+        lowerThreshold = lowerPot.read() * 50.0f;
+
+        // -------- Reading safety so lower temp isnt higher than upper -------- //
+        if (lowerThreshold > upperThreshold)
+            lowerThreshold = upperThreshold;
+
+        // -------- LED + Buzzer Alarm-------- //
+        if (currentTemp > upperThreshold) {
+            rLed = 1; 
+            yLed = 0; 
+            bLed = 0;
+
+            if (!alarmMuted)
+            buzzer.write(0.25f);     // High temp alarm tone
+            else
+            buzzer.write(0.0f);
+        }
+        else if (currentTemp < lowerThreshold) {
+            rLed = 0; 
+            yLed = 0; 
+            bLed = 1;
+
+            if (!alarmMuted)
+            buzzer.write(0.50f);     // Low temp alarm tone
+            else
+            buzzer.write(0.0f);
+        }
+        else {
+            rLed = 0; 
+            yLed = 1; 
+            bLed = 0;
+            buzzer.write(0.0f);
+        }
+
+        // -------- LCD UPDATE  -------- //
+        if (lcdTimer.elapsed_time().count() > 200000) {   // used to prevent issues with LCD corruption 
+             lcdTimer.reset();                            // due to bugs with pwm and noise on the rail
+           
+            lcd.set_cursor(1, 0);
+            lcd.printf("Cur: %2d.%1d C", int(currentTemp), int((currentTemp - int(currentTemp)) * 10));
+                       
+            lcd.set_cursor(2, 0);
+            lcd.printf("MaxHr: %2d.%1d C", int(maxTempHour), int((maxTempHour - int(maxTempHour)) * 10));
+
+            lcd.set_cursor(3, 0);
+            lcd.printf("MinHr: %2d.%1d C", int(minTempHour), int((minTempHour - int(minTempHour)) * 10));
+
+            lcd.clear_line(4);
+            lcd.set_cursor(4, 0);
+            lcd.printf("Upp:%2dC  Low:%2dC", (int)upperThreshold, (int)lowerThreshold);
+        }
+    }
+}
