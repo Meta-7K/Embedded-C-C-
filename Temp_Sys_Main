@@ -1,0 +1,244 @@
+#include "mbed.h"
+#include "LCD_SPI.h"
+
+// ===========================================================
+//                       HARDWARE SETUP
+// ===========================================================
+
+LCD_SPI lcd(D11, D12, D13, D10);        // MOSI, MISO, SCLK, CS
+I2C temp_sensor(I2C_SDA, I2C_SCL); // DS1631 temperature sensor
+BufferedSerial pc(USBTX, USBRX, 9600);  // Serial (optional debug)
+
+AnalogIn upperPot(A0);                  // Upper threshold potentiometer
+AnalogIn lowerPot(A1);                  // Lower threshold potentiometer
+// InterruptIn muteButton(D2);          // Button as interrupt source
+
+PwmOut     buzzer(D9);                     // Buzzer for alarms
+DigitalOut rLed(D7);                    // Red LED  = High temp
+DigitalOut yLed(D6);                    // Yellow LED = Normal
+DigitalOut bLed(D5);                    // Blue LED = Low temp
+
+// ---------------------------------------------------------- //
+//                Temp Sensor Constants
+// ---------------------------------------------------------- //
+
+const int  temp_addr  = 0x90;           // DS1631 I2C address
+char       commands[] = {0x51, 0xAA};   // 0x51: start convert, 0xAA: read temp
+
+// ----------------------------------------------------------- //
+//                Shared Globals (Mutex protection)
+// ----------------------------------------------------------- //
+
+Mutex stateMutex;                       // Protects shared variables
+
+float upperThreshold = 26.0f;           // Default thresholds
+float lowerThreshold = 20.0f;
+
+float currentTemp    = 0.0f;            // Latest temperature
+float maxTempHour    = 0.0f;            // Max temp within last hour
+float minTempHour    = 0.0f;            // Min temp within last hour
+
+bool  firstSample    = true;            // For initialising max/min
+bool  alarmMuted     = false;           // muteButton check / mute 
+
+uint32_t hourTimerMs = 0;               // Approx elapsed time for hour window
+
+
+// =========================================================== //
+//                        THREADS
+// =========================================================== //
+
+
+Thread controlThread;                   // Reads temp, pots, drives LEDs/buzzer
+Thread lcdThread;                       // Periodically updates LCD
+
+// ----------------------------------------------------------- //
+//                TEMPERATURE READ FUNCTION
+//              Called only from control thread
+// ----------------------------------------------------------- //
+
+float read_temperature()
+{
+    char read_temp[2];
+
+    // Start temperature conversion
+    temp_sensor.write(temp_addr, &commands[0], 1, false);
+    ThisThread::sleep_for(200ms);                   // Wait for conversion
+
+    // Read last converted temperature
+    temp_sensor.write(temp_addr, &commands[1], 1, false);
+    temp_sensor.read(temp_addr, read_temp, 2);
+
+    // DS1631: 16-bit signed, 1/256 °C per LSB
+    int16_t raw = (read_temp[0] << 8) | read_temp[1];
+    float temp = raw / 256.0f;
+
+    return temp;
+}
+
+// ------------------- CONTROL THREAD ---------------------- //
+//              Reads Temperature and potenciometers
+//              Updates max/min temprature
+//              Drives LEDs and buzzer alarm
+// --------------------------------------------------------- //
+
+void control_thread()
+{
+    while (1) {
+
+        // ---------  Read current temperature --------- //
+        float temp = read_temperature();
+
+        // --------- Read thresholds from both pots --------- //
+        // Map 0.0 - 1.0 ADC to 0 - 50 °C range 
+        float upper = upperPot.read() * 50.0f;
+        float lower = lowerPot.read() * 50.0f;
+
+        // Ensure lowerThreshold <= upperThreshold
+        if (lower > upper) {
+            lower = upper;
+        }
+
+        // ---------  Update shared state (with mutex) --------- //
+        stateMutex.lock();
+
+        currentTemp     = temp;
+        upperThreshold  = upper;
+        lowerThreshold  = lower;
+
+        // Hourly max/min tracking
+        if (firstSample) {
+            maxTempHour  = temp;
+            minTempHour  = temp;
+            firstSample  = false;
+            hourTimerMs  = 0;
+        } else {
+            if (temp > maxTempHour) maxTempHour = temp;
+            if (temp < minTempHour) minTempHour = temp;
+        }
+
+        hourTimerMs += 200;                 // This loop runs roughly every 200 ms
+        if (hourTimerMs >= 3600000) {       // 1 hour = 3,600,000 ms
+            hourTimerMs = 0;
+            maxTempHour = temp;
+            minTempHour = temp;
+        }
+
+        // ---------  LED + buzzer alarm logic --------- //
+        if (temp > upperThreshold) {
+            // High temperature
+            rLed = 1; 
+            yLed = 0; 
+            bLed = 0;
+
+            if (!alarmMuted)
+                buzzer.write(0.25f);     // High temp alarm tone
+            else
+                buzzer.write(0.0f);
+        }
+        else if (temp < lowerThreshold) {
+            // Low temperature
+            rLed = 0; 
+            yLed = 0; 
+            bLed = 1;
+
+            if (!alarmMuted)
+                buzzer.write(0.50f);     // Low temp alarm tone
+            else
+                buzzer.write(0.0f);
+        }
+        else {
+            // Normal range
+            rLed = 0; 
+            yLed = 1; 
+            bLed = 0;
+            buzzer.write(0.0f);
+        }
+
+        stateMutex.unlock();
+
+        // ---------  Sleep until next control cycle --------- //
+        ThisThread::sleep_for(200ms);   // 200ms control loop
+    }
+}
+
+// ------------------- LCD THREAD --------------------- //
+//         Periodically reads shared state
+//             Updates all 4 LCD lines
+// ---------------------------------------------------- //
+
+void lcd_thread()
+{
+    while (1) {
+
+        float temp, maxH, minH, upper, lower;
+
+        // Copy shared values under mutex
+        stateMutex.lock();
+        temp  = currentTemp;
+        maxH  = maxTempHour;
+        minH  = minTempHour;
+        upper = upperThreshold;
+        lower = lowerThreshold;
+        stateMutex.unlock();
+
+        // --------- Update LCD --------- //
+
+        lcd.set_cursor(1, 0);
+        lcd.printf("Cur: %2d.%1d C   ",int(temp), int((temp - int(temp)) * 10));
+
+        lcd.set_cursor(2, 0);
+        lcd.printf("MaxHr:%2d.%1d C   ",int(maxH), int((maxH - int(maxH)) * 10));
+                   
+        lcd.set_cursor(3, 0);
+        lcd.printf("MinHr:%2d.%1d C   ",int(minH), int((minH - int(minH)) * 10));        
+
+        lcd.clear_line(4);
+        lcd.set_cursor(4, 0);
+        lcd.printf("Upp:%2dC  Low:%2dC",(int)upper, (int)lower);
+
+        // Limit LCD refresh rate 
+        ThisThread::sleep_for(200ms);
+    }
+}
+
+// --------------- MAIN THREAD ---------------------- // 
+//             Hardware + LCD init
+//             Starts RTOS threads
+// ---------------------------------------------------//
+
+int main()
+{
+    // ---- Buzzer ---- //
+    buzzer.period_us(500);     // 2 kHz
+    buzzer.write(0.0f);        // Off initially
+
+    // ---- LEDs ---- //
+    rLed = 0;
+    yLed = 0;
+    bLed = 0;
+
+    // ---- LCD Init ---- //
+    lcd.init_lcd();
+    lcd.clr_lcd();
+
+    lcd.set_cursor(1, 0);
+    lcd.printf(" Temperature System ");
+
+    lcd.set_cursor(3, 0);
+    lcd.printf(".....Starting Up....");
+
+    ThisThread::sleep_for(2000ms);
+    lcd.clr_lcd();
+
+    // ---- Start Threads ---- //
+    controlThread.start(control_thread);
+    lcdThread.start(lcd_thread);
+
+    // ---- Main thread Sleep ----- //
+    
+    //infinite Loop
+    while (true) {
+        ThisThread::sleep_for(1s);
+    }
+}
