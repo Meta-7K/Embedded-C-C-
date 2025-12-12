@@ -1,0 +1,147 @@
+#ifndef LCD_SPI_H
+#define LCD_SPI_H
+
+#include "mbed.h"
+
+
+// ---- LCD Control Flags ---- //
+#define ENABLE        0x08
+#define COMMAND_MODE  0x00
+#define DATA_MODE     0x04
+
+class LCD_SPI {                  // Class data structure created to organise object class LCD
+public:
+
+   
+    LCD_SPI(PinName mosi, PinName miso, PinName sclk, PinName cs_pin)
+        : cs(cs_pin), spi(mosi, miso, sclk)
+    {
+        cs = 1;                       // CS idle HIGH (constant = 1)
+        spi.format(8, 0);             // 8-bit frames, mode 0
+        spi.frequency(1000000);       // 1 MHz
+    }
+
+    // ------- Public Interface ---- //
+    void init_lcd();
+    void clr_lcd();
+    void print_lcd(const char *string);
+    void set_cursor(int line, int column = 0);
+    void clear_line(int line);
+    void printf(const char *format, ...);
+    
+
+
+private:
+
+    // ---- Pins / SPI Interface ---- //
+    DigitalOut cs;
+    SPI spi;
+
+    // ---- Internal helper functions ---- //
+    void shift_out(int data);
+    void write_cmd(int cmd);
+    void write_data(char c);
+    void write_4bit(int data, int mode);
+};
+
+
+// ------------ Function Definitions ------------- //
+
+inline void LCD_SPI::init_lcd() {
+
+    thread_sleep_for(40);
+
+    shift_out(0x30);
+    wait_ns(37);
+    write_cmd(0x20);
+    wait_us(37);
+    write_cmd(0x20);
+    wait_us(37);
+    write_cmd(0x0C);
+    wait_us(37);
+    write_cmd(0x01);
+    wait_us(1520);
+    write_cmd(0x06);
+    wait_us(37);
+    write_cmd(0x28);
+    wait_us(37);
+}
+
+inline void LCD_SPI::write_4bit(int data, int mode) {
+
+    int hi_n = (data & 0xF0);
+    int lo_n = ((data << 4) & 0xF0);
+
+    shift_out(hi_n | ENABLE | mode);
+    wait_us(1);
+    shift_out(hi_n & ~ENABLE);
+
+    shift_out(lo_n | ENABLE | mode);
+    wait_us(1);
+    shift_out(lo_n & ~ENABLE);
+}
+
+inline void LCD_SPI::shift_out(int data) {
+    cs = 0;
+    spi.write(data);
+    cs = 1;                                              // CS constant HIGH at idle
+}
+
+inline void LCD_SPI::write_cmd(int cmd) {
+    write_4bit(cmd, COMMAND_MODE);
+}
+
+inline void LCD_SPI::write_data(char c) {
+    write_4bit(c, DATA_MODE);
+}
+
+inline void LCD_SPI::clr_lcd() {
+    write_cmd(0x01);
+    wait_us(1520);
+}
+
+inline void LCD_SPI::print_lcd(const char *string) {
+    while (*string) {
+        write_data(*string++);
+        wait_us(40);
+    }
+}
+
+inline void LCD_SPI::set_cursor(int line, int column) {
+    static const int line_addr[] = {0x00, 0x40, 0x14, 0x54};
+
+    if (line < 1 || line > 4) return;                    // invalid line
+    if (column < 0 || column > 19) return;
+
+    int addr = line_addr[line - 1] + column;
+    write_cmd(0x80 | addr);                             //  address command
+}
+
+inline void LCD_SPI::clear_line(int line) {
+    if (line < 1 || line > 4) return;
+
+    set_cursor(line, 0);                                // Move cursor to start of specified line
+
+    for (int i = 0; i < 20; i++) {                      // Write 20 spaces to clear the line
+        write_data(' ');
+        wait_us(40);
+    }
+
+    set_cursor(line, 0);                                // Return cursor back to start of line
+}
+
+inline void LCD_SPI::printf(const char *format, ...) {
+    char buffer[80];                                                    // Array char size (20x4 = max 80 chars)
+    
+    va_list args;                                                       // Declare a list of arguments
+    va_start(args, format);                                             // Initialize argument reading
+    vsnprintf(buffer, sizeof(buffer), format, args);                    // Formats string and writes to buffer
+    va_end(args);                                                       // Cleans up argument list -- Avoids memory issue 
+
+    print_lcd(buffer);                                                  // Sends completed characters to LCD to print
+}
+
+
+
+
+#endif // ----------  LCD_SPI_H ------------- //
